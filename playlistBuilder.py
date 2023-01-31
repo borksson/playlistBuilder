@@ -4,15 +4,21 @@ import os
 from urllib.parse import quote
 import numpy as np
 import time
+import sys
+import json
+
+VERBOSE = False
 
 class TrackInfo:
-    def __init__(self, name: str= None, artist: str= None, album: str= None, year: int= None, id: str = None, href: str = None) -> None:
+    def __init__(self, name: str= None, artist: str= None, album: str= None, year: int= None, id: str = None, href: str = None, releaseDate: str = None) -> None:
         self.name = name
         self.artist = artist
         self.album = album
         self.year = year
         self.id = id
         self.href = href
+        if releaseDate:
+            self.year = releaseDate[-4:]
 
     def genQuery(self) -> str:
         qName = "track:"+self.name if self.name else None
@@ -66,22 +72,27 @@ class PlaylistBuilder:
         self.auth = self.getAuthtoken(client_id, client_secret)
         self.session = CachedSession(cache_name="cache", backend="sqlite", expire_after=3600)
 
-    def run(self):
+    def run(self, limit: int):
         tracks = [self.searchTrack(track) for track in self.tracks]
+        tracks = [track for track in tracks if track]
         tracks = self.getAudioFeatures(tracks)
         model = self.genAverageModel(tracks)
         seeds = self.getBestSeeds(tracks, model)
-        recommendedSongs = self.getModelRecommendations(model, seeds)
+        recommendedSongs = self.getModelRecommendations(model, seeds, limit=limit)
+        # Remove duplicates
+        recommendedSongs = [track for track in recommendedSongs if track.track_info.id not in [track.track_info.id for track in tracks]]
+        if len(recommendedSongs) > limit:
+            recommendedSongs = recommendedSongs[:limit]
         # Make playlist a set to remove duplicates
         return recommendedSongs
 
     def getAuthtoken(self, client_id: str, client_secret: str) -> str:
-        print("GENERATING AUTH TOKEN")
+        if (VERBOSE): print("GENERATING AUTH TOKEN")
         response = requests.post("https://accounts.spotify.com/api/token", data={"grant_type": "client_credentials", "client_id": client_id, "client_secret": client_secret})
         return "Bearer " + response.json()["access_token"]
 
     def searchTrack(self, track: Track):
-        print("SEARCHING FOR TRACK: " + track.track_info.name)
+        if (VERBOSE): print("SEARCHING FOR TRACK: " + track.track_info.name)
         q = track.track_info.genQuery()
         response = self.session.get(
             "https://api.spotify.com/v1/search",
@@ -90,6 +101,8 @@ class PlaylistBuilder:
         )
         if not response.from_cache:
             time.sleep(SLEEP_TIME)
+        if len(response.json()["tracks"]["items"]) == 0:
+            return
         track = response.json()["tracks"]["items"][0]
         data = {
             "name": track["name"],
@@ -103,7 +116,7 @@ class PlaylistBuilder:
         return track
 
     def getAudioFeatures(self, tracks: list[Track]):
-        print("GETTING AUDIO FEATURES")
+        if (VERBOSE): print("GETTING AUDIO FEATURES")
         ids = [track.track_info.id for track in tracks]
         response = self.session.get(
             "https://api.spotify.com/v1/audio-features",
@@ -118,21 +131,20 @@ class PlaylistBuilder:
         return tracks
 
     def genAverageModel(self, tracks: list[Track]) -> AudioModel:
-        print("GENERATING AVERAGE MODEL")
+        if (VERBOSE): print("GENERATING AVERAGE MODEL")
         mat = np.matrix([track.audio_features.model.getNumpyVector() for track in tracks])
         return AudioModel(*mat.mean(axis=0).tolist()[0])
 
     def getBestSeeds(self,tracks: list[Track], model: AudioModel, limit: int = 5) -> list[Track]:
-        print("GETTING BEST SEEDS")
+        if (VERBOSE): print("GETTING BEST SEEDS")
         # if len(tracks) <= limit:
         #     return tracks
         mat = np.matrix([track.audio_features.model.getNumpyVector() for track in tracks])
         dist = np.linalg.norm(mat - model.getNumpyVector(), axis=1)
-        print(dist)
         return [tracks[i] for i in dist.argsort()[:limit]]
 
     def getModelRecommendations(self, model: AudioModel, seed_tracks: list[Track], limit: int = 10, cache: bool = True):
-        print("GENERATING RECOMMENDATIONS")
+        if (VERBOSE): print("GENERATING RECOMMENDATIONS")
         # Todo: replace with top 5 most similar tracks to model
         ids = [track.track_info.id for track in seed_tracks]
         params = {
@@ -177,22 +189,32 @@ class PlaylistBuilder:
         return tracks
 
 
+if __name__ == "__main__":
+    CLIENT_ID = os.environ.get("CLIENT_ID")
+    CLIENT_SECRET = os.environ.get("CLIENT_SECRET")
+    SLEEP_TIME = 0.1
 
-CLIENT_ID = os.environ.get("CLIENT_ID")
-CLIENT_SECRET = os.environ.get("CLIENT_SECRET")
-SLEEP_TIME = 0.1
+    data = " ".join(sys.argv[1:])
+    data = json.loads(data)
 
-# TODO: Cache token
+    tracks = [Track(track_info=TrackInfo(**track)) for track in data["tracks"]]
+    # TODO: Cache token
 
-trackA = Track(track_info=TrackInfo(name="Sailing", artist="Christopher Cross", year=1979))
-trackB = Track(track_info=TrackInfo(name="The Sounds of Silence", artist="Simon & Garfunkel", year=1964))
+    playlistBuilder = PlaylistBuilder(CLIENT_ID, CLIENT_SECRET, tracks)
 
-playlistBuilder = PlaylistBuilder(CLIENT_ID, CLIENT_SECRET, [trackA, trackB])
+    playlist = playlistBuilder.run(data["limit"])
 
-playlist = playlistBuilder.run()
+    playlist = [track.track_info.__dict__ for track in playlist]
 
-for track in playlist:
-    print(track.track_info.name)
+    playlist = {
+        "tracks": playlist,
+    }
+
+    print(json.dumps(playlist))
+
+    
+
+    # TODO: Fix inserting repeated tracks
 
 # WITH TARGETS
 # クラウディ Simon & Garfunkel
